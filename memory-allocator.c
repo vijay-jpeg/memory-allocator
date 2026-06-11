@@ -45,5 +45,13 @@ void free(void *ptr) {      // takes a pointer to the memory to be freed and add
     free_list = block;
 }
 
+void display_memory() {     // displays the current state of the free list
+    static block_t *free_list = NULL;
+    block_t *current = free_list;
 
+    while (current) {
+        printf("Block size: %zu\n", current->size);
+        current = current->next;
+    }
+}
 
