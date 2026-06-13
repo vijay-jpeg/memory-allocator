@@ -3,11 +3,12 @@
 #include <stdio.h>
 #include <assert.h>
 #include <stdint.h>
+#include <pthread.h>
 
 typedef struct block {      
     uint32_t size;
-    block_t *prev;
-    block_t *next;     
+    struct block *prev;
+    struct block *next;     
     bool free;              
 } block_t;
 
@@ -17,10 +18,10 @@ typedef struct {
     uint32_t used_memory;             
 } memory_stats;
 
+static _Thread_local block_t *block_list = NULL; // head of the free list
+static _Thread_local memory_stats stats = {0, 0, 0}; // initialize memory statistics
 
 void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated and returns a pointer to the allocated memory
-    static block_t *block_list = NULL;
-    static memory_stats stats = {0, 0, 0};
     block_t *current = block_list;
     block_t *smallest_block = NULL;
     block_t *largest_block = NULL;
@@ -40,14 +41,16 @@ void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated
     }
 
     // Check the last block in the list
-    if (current->size >= size && current->free) {
-        if (smallest_block == NULL || current->size < smallest_block->size) {
-            smallest_block = current;
+    if (current){
+        if (current->size >= size && current->free) {
+            if (smallest_block == NULL || current->size < smallest_block->size) {
+                smallest_block = current;
+            }
         }
-    }
-    if (current->size < size && current->free) {
-        if (largest_block == NULL || current->size > largest_block->size) {
-            largest_block = current;
+        if (current->size < size && current->free) {
+            if (largest_block == NULL || current->size > largest_block->size) {
+                largest_block = current;
+            }
         }
     }
 
@@ -68,7 +71,7 @@ void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated
 
         if (smallest_block->size > size) {
             // return the extra memory to the os
-            if (brk(smallest_block + sizeof(block_t) + size) == -1) {
+            if (brk(smallest_block + sizeof(block_t) + size) != 0) {
                 return NULL; // brk failed
             }
         }
@@ -92,7 +95,7 @@ void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated
         current->next = largest_block;
         largest_block->prev = current;
 
-        if (brk(largest_block + sizeof(block_t) + size) == -1) {
+        if (brk(largest_block + sizeof(block_t) + size) != 0) {
             return NULL;
         }
 
@@ -108,13 +111,22 @@ void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated
         new_block->size = size;
         new_block->free = false;
         new_block->next = NULL;
-        current->next = new_block;
-        new_block->prev = current;
+        new_block->prev = NULL;
+
+        if (current) {
+            current->next = new_block;
+            new_block->prev = current;
+        } else {
+            block_list = new_block;
+        }
+        
         stats.total_memory += size;
         stats.used_memory += size;
         stats.total_blocks++;
         return (void *)(new_block + 1);
     }
+
+    return NULL; // should never reach here
 
 }
 
@@ -124,32 +136,40 @@ void my_free(void *ptr) {
     }
     block_t *block = (block_t *)ptr - 1;
     block->free = true;
-    static block_t *block_list = NULL;
-    block->next = block_list;
+
+    stats.used_memory -= block->size;
 }
 
 void display_memory() {     // displays the current state of the free list
-    static block_t *free_list = NULL;
-    block_t *current = free_list;
+    block_t *current = block_list;
+    printf("Total memory: %u bytes\n", stats.total_memory);
+    printf("Used memory: %u bytes\n", stats.used_memory);
+    printf("Total blocks: %u\n", stats.total_blocks);
 
-    static memory_stats stats = {0, 0, 0};
-    printf("Total memory: %zu bytes\n", stats.total_memory);
-    printf("Used memory: %zu bytes\n", stats.used_memory);
-    printf("Total blocks: %zu\n", stats.total_blocks);
-
+    uint32_t i = 0;
     while (current) {
-        printf("Block size: %zu\n", current->size);
+        printf("Block %d size: %u\n", ++i, current->size);
         current = current->next;
     }
 }
 
 
 int main() {
-    display_memory();
     void *ptr1 = my_malloc(100);
-    void *ptr2 = my_malloc(200);
-    display_memory();
-    my_free(ptr1);
-    display_memory();
-    return 0;
+    void *ptr2 = my_malloc(100);
+
+    assert(stats.total_blocks == 2);
+    assert(stats.total_memory == 200);
+    assert(stats.used_memory == 200);
+
+    my_free(ptr2);
+    assert(stats.used_memory == 100);
+
+    void * ptr3 = my_malloc(150);
+
+    assert(stats.total_blocks == 2);
+    assert(stats.total_memory == 250);
+    assert(stats.used_memory == 250);
+    
+    printf("PASSED\n");
 }
