@@ -9,7 +9,7 @@ typedef struct block {
     uint32_t size;
     struct block *prev;
     struct block *next;     
-    bool free;              
+    bool free;
 } block_t;
 
 typedef struct {             
@@ -20,21 +20,16 @@ typedef struct {
 
 static _Thread_local block_t *block_list = NULL; // head of the free list
 static _Thread_local memory_stats stats = {0, 0, 0}; // initialize memory statistics
+pthread_mutex_t brk_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated and returns a pointer to the allocated memory
     block_t *current = block_list;
     block_t *smallest_block = NULL;
-    block_t *largest_block = NULL;
 
     while (current && current->next) {
         if (current->size >= size && current->free) {
-            if (smallest_block == NULL || current->size < smallest_block->size) {
+            if (smallest_block == NULL || current->size <= smallest_block->size) {
                 smallest_block = current;   // smallest free block that can accommodate the requested size
-            }
-        }
-        if (current->size < size && current->free) {
-            if (largest_block == NULL || current->size > largest_block->size) {
-                largest_block = current;    // largest block available that is smaller than the requested size
             }
         }
         current = current->next;
@@ -47,64 +42,56 @@ void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated
                 smallest_block = current;
             }
         }
-        if (current->size < size && current->free) {
-            if (largest_block == NULL || current->size > largest_block->size) {
-                largest_block = current;
-            }
-        }
     }
 
     if (smallest_block) {
         smallest_block->free = false;
-        // move the block to the end of the list
-        if (smallest_block->prev) {
-            smallest_block->prev->next = smallest_block->next;
-        } else {
-            block_list = smallest_block->next; // update head if the smallest block is the first block
-        }
-        if (smallest_block->next) {
-            smallest_block->next->prev = smallest_block->prev;
-        }
-        
-        current->next = smallest_block;
-        smallest_block->prev = current;
 
-        if (smallest_block->size > size) {
-            // return the extra memory to the os
-            if (brk(smallest_block + sizeof(block_t) + size) != 0) {
-                return NULL; // brk failed
+        // if the block is the newest allocated one
+        if (smallest_block == current) {
+            if (smallest_block->size - size >= sizeof(block_t) + 16) {     // ensure it's worth trimming
+                // move the break downward to return memory to the OS
+                pthread_mutex_lock(&brk_lock);
+                brk((char *)smallest_block + sizeof(block_t) + size);
+                stats.total_memory -= smallest_block->size - size;
+                pthread_mutex_unlock(&brk_lock);
             }
         }
 
-        stats.total_memory += smallest_block->size - size;
-        stats.used_memory += size;
+        else if (smallest_block->size >= size + sizeof(block_t) + 16) {   // ensure there is enough extra space for splitting
+            block_t *split_block = (block_t *) ((char *)(smallest_block + 1) + size);
+            split_block->size = smallest_block->size - size - sizeof(block_t);
+            split_block->free = true;
+            split_block->next = smallest_block->next;
+            if (smallest_block->next) {
+                smallest_block->next->prev = split_block;
+            }
+            smallest_block->next = split_block;
+        }
+        
+
         smallest_block->size = size;
+        stats.used_memory += size;
 
         return (void *)(smallest_block + 1);
-    } else if (largest_block) {
-        largest_block->free = false;
-        // move the block to the end of the list
-        if (largest_block->prev) {
-            largest_block->prev->next = largest_block->next;
-        } else {
-            block_list = largest_block->next; // update head if the largest block is the first block
-        }
-        if (largest_block->next) {
-            largest_block->next->prev = largest_block->prev;
-        }
-        current->next = largest_block;
-        largest_block->prev = current;
+    } else if (current && current->free) {       // if no block has enough space, extend the last one if it is free
+        current->free = false;
 
-        if (brk(largest_block + sizeof(block_t) + size) != 0) {
-            return NULL;
-        }
+        pthread_mutex_lock(&brk_lock);
+        brk((char *)current + sizeof(block_t) + size);
+        pthread_mutex_unlock(&brk_lock);
 
-        largest_block->size = size;
-        stats.total_memory += size - largest_block->size;
+        current->size = size;
+        stats.total_memory += size - current->size;
         stats.used_memory += size;
+
+        return (void *)(current + 1);
     } else {
         // No suitable block found, request more memory from the system
+        pthread_mutex_lock(&brk_lock);
         block_t *new_block = sbrk(sizeof(block_t) + size);
+        pthread_mutex_unlock(&brk_lock);
+
         if (new_block == (void *)-1) {
             return NULL; // sbrk failed
         }
@@ -113,7 +100,7 @@ void *my_malloc(uint32_t size) {     // takes the size of memory to be allocated
         new_block->next = NULL;
         new_block->prev = NULL;
 
-        if (current) {
+        if (current) {      // if block list is not empty
             current->next = new_block;
             new_block->prev = current;
         } else {
@@ -155,21 +142,59 @@ void display_memory() {     // displays the current state of the free list
 
 
 int main() {
+
     void *ptr1 = my_malloc(100);
-    void *ptr2 = my_malloc(100);
-
-    assert(stats.total_blocks == 2);
-    assert(stats.total_memory == 200);
-    assert(stats.used_memory == 200);
-
-    my_free(ptr2);
+    assert(ptr1 != NULL);
+    
+    // verify stats tracking for a single block
+    assert(stats.total_blocks == 1);
     assert(stats.used_memory == 100);
 
-    void * ptr3 = my_malloc(150);
+    void *ptr2 = my_malloc(200);
+    assert(ptr2 != NULL);
+    assert(ptr1 != ptr2); // pointers must be distinct
+
+    // ensure payloads do not overlap
+    if (ptr1 < ptr2) {
+        assert((char *)ptr1 + 100 <= (char *)ptr2);
+    } else {
+        assert((char *)ptr2 + 200 <= (char *)ptr1);
+    }
 
     assert(stats.total_blocks == 2);
-    assert(stats.total_memory == 250);
-    assert(stats.used_memory == 250);
+    assert(stats.used_memory == 300);
+
+    unsigned char *c1 = (unsigned char *)ptr1;
+    unsigned char *c2 = (unsigned char *)ptr2;
     
-    printf("PASSED\n");
+    for (int i = 0; i < 100; i++) c1[i] = 0xAA;
+    for (int i = 0; i < 200; i++) c2[i] = 0xBB;
+
+    // verify data remained uncorrupted after filling adjacent blocks
+    for (int i = 0; i < 100; i++) assert(c1[i] == 0xAA);
+    for (int i = 0; i < 200; i++) assert(c2[i] == 0xBB);
+
+    my_free(ptr1);
+    assert(stats.used_memory == 200); // only ptr2 (200 bytes) should be marked active
+
+    // test double-free safety or NULL handling if your code allows it
+    my_free(NULL); 
+    assert(stats.used_memory == 200);
+
+    // requesting exactly 100 bytes again should recycle the block pointed to by ptr1
+    void *ptr3 = my_malloc(100);
+    assert(ptr3 == ptr1); 
+    assert(stats.used_memory == 300);
+    // total blocks should not increase if an entire existing block was recycled
+    assert(stats.total_blocks == 2); 
+
+    // requesting a size larger than any free block should trigger a new system allocation
+    void *ptr4 = my_malloc(500);
+    assert(ptr4 != NULL);
+    assert(ptr4 != ptr1 && ptr4 != ptr2);
+    assert(stats.total_blocks == 3);
+    assert(stats.used_memory == 800);
+
+    printf("All assertions passed\n");
+    return 0;
 }
