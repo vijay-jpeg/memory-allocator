@@ -195,6 +195,8 @@ int main() {
     assert(stats.total_blocks == 3);
     assert(stats.used_memory == 800);
 
+    pthread_mutex_destroy(&brk_lock);
+
     printf("All assertions passed\n");
     return 0;
 }
